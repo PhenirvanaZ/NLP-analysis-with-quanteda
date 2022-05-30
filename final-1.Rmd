@@ -1,0 +1,428 @@
+---
+title: "ECON7930 Final Project"
+author: "Gong Jiaxin, ZENG Chengxin, ZHAI Rui"
+date: "2022/5/10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+rm(list=ls())
+setwd(here::here())
+```
+
+```{r}
+library(pacman)
+p_load("readr","ineq","lattice","dplyr","data.table","reshape2","tidyverse","tidyr","quanteda",
+       "quanteda.textstats","quanteda.textmodels","caret","glmnet","ROCR","corpus","tidytext","wordcloud")
+```
+
+##Open data
+```{r}
+raw <- read.csv("Womens Clothing E-Commerce Reviews.csv")
+```
+
+##Clothing ID and Count
+```{r}
+raw %>%
+  group_by(`Clothing.ID`) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) %>%
+  ungroup() %>%
+  mutate(clothid = reorder(`Clothing.ID`,Count)) %>%
+  head(10) %>%
+  ggplot(aes(x = clothid, y = Count)) +
+  geom_bar(stat='identity',colour="white", fill = 'yellow') +
+  geom_text(aes(x = clothid, y = 1, label = paste0("(",Count,")",sep="")),
+            hjust=0, vjust=.5, size = 4, colour = 'black',
+            fontface = 'bold') +
+  labs(x = 'ID of Cloth', 
+       y = 'Count', 
+       title = 'Clothing ID and Count') +
+  coord_flip() +
+  theme_bw()
+```
+
+##Concentration of Clothings in data
+```{r}
+x <- table(raw$`Clothing.ID`)
+lc.cloth <- Lc(x)
+g.cloth <- ineq(x)
+# create data.frame from LC
+p <- lc.cloth[1]
+L <- lc.cloth[2]
+df <- data.frame(p,L)
+ggplot(data = df) +
+  geom_line(aes(x = p, y = L), color="red") +
+  scale_x_continuous(name="Cumulative share of X", limits=c(0,1)) + 
+  scale_y_continuous(name="Cumulative share of Y", limits=c(0,1)) +
+  geom_abline() +
+  labs(title = paste("Concentration of Clothings in data (Gini:", round(g.cloth, 2), ")"))
+```
+
+
+```{r}
+xyplot(factor(Rating) ~ Age|factor(`Division.Name`), groups = factor(`Recommended.IND`),
+       data = raw)
+```
+
+```{r}
+bwplot(Rating ~ factor(`Recommended.IND`)|factor(`Division.Name`),
+       data = raw)
+```
+
+```{r}
+bwplot(factor(Rating) ~ Age|factor(`Division.Name`) + factor(`Recommended.IND`), 
+       data = raw, xlab = "Age", main = "Age, Rating and Recommendation status")
+```
+
+##Sentiment analysis: analyzing reviews
+```{r}
+raw %>% 
+  unnest_tokens(word, `Review.Text`) %>% 
+  anti_join(stop_words) %>% 
+  count(word, sort = TRUE) %>%
+  head(10) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  labs(x = NULL, title = "Most used words in Reviews") +
+  coord_flip()
+```
+
+##wordclouds
+```{r}
+set.seed(123)
+library(quanteda)
+raw.corpus<- corpus(raw$Review.Text) 
+raw.corpus %>% 
+  corpus_reshape("sentence") %>% 
+  tokens(remove_punct = TRUE,
+         remove_symbols = TRUE,
+         remove_numbers = TRUE,
+         remove_url = TRUE) %>% 
+  tokens_remove(stopwords(), padding = TRUE) -> raw.toks
+
+raw.toks %>% 
+  dfm() %>%
+  dfm_remove("") %>% 
+  dfm_select("^\\p{L}+$", valuetype = "regex", min_nchar = 2) %>% 
+  dfm_trim(min_termfreq = 5) -> raw.dfm
+
+raw.freqs <- colSums(raw.dfm)
+raw.words <- colnames(raw.dfm)
+raw.wordlist <- data.frame(raw.words, raw.freqs)
+
+library(wordcloud2)
+wordcloud2(raw.wordlist, size=0.5, shape="circle")
+```
+
+
+##Reviews Text Analysis
+```{r}
+reviews <- raw[c(5,7)]
+sum(is.na(reviews))
+```
+
+```{r}
+head(reviews)
+```
+
+##change 'Review.Text' into corpus
+```{r}
+set.seed(123)
+reviews$Recommended.IND <- as.character(reviews$Recommended.IND)
+
+textcorpus <- corpus(reviews$Review.Text)
+docvars(textcorpus,'Recommended.IND') <- reviews$Recommended.IND
+summary(textcorpus,6) # for check, 23486
+```
+
+##Splitting Data into 80% Train and 20% Test
+```{r}
+id_train <- sample(1:23486,23486*0.80, replace=F)
+head(id_train, 10)
+docvars(textcorpus, "id_numeric") <- 1:ndoc(textcorpus)
+```
+
+```{r}
+# train data set
+reviews_train <- corpus_subset(textcorpus, id_numeric %in% id_train) %>% 
+  quanteda::tokens(remove_punct = TRUE,
+         remove_symbols = TRUE,
+         remove_numbers = TRUE,
+         remove_url = TRUE) %>% 
+  tokens_remove(stopwords(), padding = TRUE) %>% 
+  dfm()
+```
+
+```{r}
+# test data set
+reviews_test <- corpus_subset(textcorpus, !(id_numeric %in% id_train)) %>% 
+  quanteda::tokens(remove_punct = TRUE,
+         remove_symbols = TRUE,
+         remove_numbers = TRUE,
+         remove_url = TRUE) %>% 
+  tokens_remove(stopwords(), padding = TRUE) %>% 
+  dfm()
+```
+
+```{r}
+# 1.Classification: Naive Bayes
+reviews.nb <- textmodel_nb(reviews_train, docvars(reviews_train, 'Recommended.IND'), distribution = "Bernoulli")
+summary(reviews.nb)
+
+reviews_matched <- dfm_match(reviews_test, features=featnames(reviews_train))
+```
+
+```{r}
+# confusion matrix
+actual_class <- docvars(reviews_matched, "Recommended.IND")
+nb_pred <- predict(reviews.nb, newdata=reviews_matched, type="probability")
+summary(nb_pred)
+
+nb_pred_class <- predict(reviews.nb, newdata=reviews_matched)
+tab_class_nb <- table(actual_class,nb_pred_class)
+tab_class_nb   
+
+confusionMatrix(tab_class_nb, mode="everything")  
+```
+
+```{r}
+# 2.Classification: Lasso Regression
+set.seed(123)
+reviews.lasso <- cv.glmnet(x=reviews_train,
+                           y=docvars(reviews_train)$Recommended.IND,
+                           family="binomial",
+                           alpha=1,                # alpha = 1: LASSO
+                           nfolds=5,               # 5-fold cross-validation
+                           parallel=TRUE,
+                           intercept=TRUE,
+                           type.measure="class")
+```
+
+```{r}
+## the minimal MSE
+min(reviews.lasso$cvm)   # 0.1305621
+```
+
+```{r}
+# performance
+lasso_pred_value <- predict(reviews.lasso, newx=reviews_matched,s="lambda.min")[,1]
+lasso_pred_class <- rep(NA,length(lasso_pred_value))
+lasso_pred_class[lasso_pred_value>0] <- 1
+lasso_pred_class[lasso_pred_value<0] <- 0
+tab_class_lasso <- table(actual_class,lasso_pred_class)
+tab_class_lasso
+```
+
+```{r}
+# confusion matrix
+confusionMatrix(tab_class_lasso, mode="everything")
+```
+
+```{r}
+# 3.Classification: Elastic Net
+set.seed(123)
+# maintain the same folds across all models
+fold_id <- sample(x = 1:10, size = length(docvars(reviews_train)$Recommended.IND), replace = TRUE)
+# search across a range of alphas
+tuning_grid <- tibble::tibble(
+  alpha      = seq(0, 1, by = .1),
+  mse_min    = NA,
+  mse_1se    = NA,
+  lambda_min = NA,
+  lambda_1se = NA
+)
+```
+
+```{r}
+# fit CV model for each alpha value
+for(i in seq_along(tuning_grid$alpha)){
+  fit <- cv.glmnet(x=reviews_train,
+                   y=docvars(reviews_train)$Recommended.IND,
+                   family="binomial",
+                   alpha = tuning_grid$alpha[i],
+                   foldid= fold_id,
+                   nfolds=5,              # 5-fold cross-validation
+                   parallel=TRUE,
+                   intercept=TRUE,
+                   type.measure="class")
+# extract MSE and lambda values
+  tuning_grid$mse_min[i]    <- fit$cvm[fit$lambda == fit$lambda.min]
+  tuning_grid$mse_1se[i]    <- fit$cvm[fit$lambda == fit$lambda.1se]
+  tuning_grid$lambda_min[i] <- fit$lambda.min
+  tuning_grid$lambda_1se[i] <- fit$lambda.1se
+}
+tuning_grid
+tuning_grid %>%
+  mutate(se = mse_1se - mse_min) %>%          # calculate the distance of 1 SE
+  ggplot(aes(alpha, mse_min)) +               # under different alpha, plot the minimal MSE under cv
+  geom_line(size = 2) +
+  geom_ribbon(aes(ymax = mse_min + se, ymin = mse_min - se), alpha = .25) +
+  ggtitle("MSE one standard error")
+
+```
+
+```{r}
+reviews.net <- cv.glmnet(x=reviews_train,
+                         y=docvars(reviews_train)$Recommended.IND,
+                         family="binomial",
+                         alpha=0.1,
+                         nfolds=5,         # 5-fold cross-validation
+                         parallel=TRUE,
+                         intercept=TRUE,
+                         type.measure="class")
+```
+
+```{r}
+# performance
+predicted_value_net <- predict(reviews.net, newx=reviews_matched,s="lambda.min")[,1]
+predicted_class_net <- rep(NA,length(predicted_value_net))
+predicted_class_net[predicted_value_net<0] <- 0
+predicted_class_net[predicted_value_net>0] <- 1
+tab_class_net <- table(actual_class,predicted_class_net)
+tab_class_net
+```
+
+```{r}
+confusionMatrix(tab_class_net, mode="everything")
+```
+
+```{r}
+# Because models performance can not be decided by just accuracy
+# in this part positives(recommended) and negatives(not recommended) are both need to be cared
+# ROC curve and AUC area would be more useful
+
+reviews_matched$Yhat_nb = predict(reviews.nb, newdata =reviews_matched, type = "prob")
+reviews_matched$Yhat_lasso <- predict(reviews.lasso, newx=reviews_matched, type = "response")
+reviews_matched$Yhat_net = predict(reviews.net, newx = reviews_matched, type = "response")
+```
+
+```{r}
+prednb <- ifelse(reviews_matched$Yhat_nb==1, 1, 0)
+actualnb <- ifelse(reviews_matched$Recommended.IND==1, 1, 0)
+predict_nb <- prediction(reviews_matched$Yhat_nb[, "1"], reviews_matched$Recommended.IND)
+predict_lasso <- prediction(reviews_matched$Yhat_lasso, reviews_matched$Recommended.IND)
+predict_net  <- prediction(reviews_matched$Yhat_net, reviews_matched$Recommended.IND)
+```
+
+```{r}
+ROC_nb <- performance(predict_nb, "tpr", "fpr")
+ROC_lasso <- performance(predict_lasso, "tpr", "fpr")
+ROC_net <- performance(predict_net, "tpr", "fpr")
+```
+
+```{r}
+#ROC curves
+plot.new()
+plot(ROC_nb, col= "deeppink",lwd=2)
+plot(ROC_lasso, add = TRUE,col= "cyan3",lwd=2)
+plot(ROC_net,add = TRUE, col= "blueviolet",lwd=2)
+abline(0,1, col = "black")
+title("ROC curves")
+legend(0.4, 0.4 ,c("nb","lasso", "elas_net"),
+       lty = c(1,1,1),
+       lwd = c(3,3,3),
+       col = c("deeppink","cyan3", "blueviolet"),
+       ncol=1, cex=0.9, y.intersp=1.2)
+```
+
+```{r}
+# AUC area
+auc_nb = performance(predict_nb,"auc")
+auc_nb@y.values     # 0.9144538
+auc_lasso  = performance(predict_lasso,"auc")
+auc_lasso@y.values  # 0.9038083
+auc_net  = performance(predict_net,"auc")
+auc_net@y.values    # 0.9161748
+# For Elastic Net has the biggest AUC area
+# So I choose Elastic Net to predict whether the words is used for recommended or not
+```
+
+```{r}
+# check top 20 words for 'recommend' and 'not recommend'
+sort(log(colSums(reviews_train))*coef(reviews.net)[-1,1],dec=T)[1:20]    # recommend
+sort(log(colSums(reviews_train))*coef(reviews.net)[-1,1],dec=F)[1:20]    # not recommend
+```
+
+
+## Sentiment Analysis -- sentiment word = "fit"
+```{r}
+textcorpus1 <- textcorpus
+textcorpus1 %>% 
+  corpus_reshape("sentences") %>% 
+  quanteda::tokens(remove_punct = TRUE,
+         remove_symbols = TRUE,
+         remove_numbers = TRUE,
+         remove_url = TRUE) %>% 
+  tokens_remove(stopwords("en"), padding = TRUE) -> toks
+
+reviews_all <- rbind(reviews_train, reviews_test)
+p_load("LSX")
+fit <- char_context(toks, "fit*", p = 0.05)
+
+lss <- textmodel_lss(reviews_all, as.seedwords(data_dictionary_sentiment), terms = fit, k = 300, cache = TRUE)
+
+head(coef(lss), 10) # most positive words
+```
+
+```{r}
+tail(coef(lss), 10) # most negative words
+```
+
+```{r}
+textplot_terms(lss, highlighted = c("exchanged", "matches", "tad", "everywhere"))
+```
+
+## Related words to "fit"
+```{r}
+fit_all <- c("fit", "suitable", "befitting")
+toks_inside <- tokens_keep(toks, pattern = fit_all, window = 5)
+toks_inside <- tokens_remove(toks_inside, pattern = fit_all) # remove the keywords
+toks_outside <- tokens_remove(toks, pattern = fit_all, window = 5)
+
+dfmat_inside <- dfm(toks_inside)
+dfmat_outside <- dfm(toks_outside)
+
+tstat_key_inside <- textstat_keyness(rbind(dfmat_inside, dfmat_outside), 
+                                     target = seq_len(ndoc(dfmat_inside)))
+head(tstat_key_inside, 50)
+
+```
+
+```{r}
+tail(tstat_key_inside, 20)
+```
+
+
+```{r}
+p_load("quanteda.textplots")
+textplot_keyness(tstat_key_inside, color = c("orange", "grey"), n = 20)+
+  labs(
+    title = "Related Words to 'fit'",
+    x = "relative score", 
+    y = "words",
+  )
+ggsave("Related Words to 'fit'.png", width = 10, height = 6)
+```
+
+
+## Top features: highest number of co-occurrences of tokens
+```{r}
+topfeatures(reviews_all)
+```
+
+```{r}
+feat <- names(topfeatures(reviews_all, 50))
+dfmat_reviews_select <- dfm_select(reviews_all, pattern = feat, selection = "keep")
+dim(dfmat_reviews_select)
+```
+
+```{r}
+size <- log(colSums(dfm_select(reviews_all, feat, selection = "keep")))
+
+set.seed(123)
+textplot_network(dfmat_reviews_select, min_freq = 0.8, vertex_size = size / max(size) * 3)
+```
+
